@@ -270,6 +270,36 @@ class SuperGlue(nn.Module):
                 )
             )
 
+    def predict(self, data, convert_to_probs: bool = True) -> torch.Tensor:
+        desc0, desc1 = data["descriptors0"], data["descriptors1"]
+        kpts0, kpts1 = data["keypoints0"], data["keypoints1"]
+
+        # kpts0 = normalize_keypoints(kpts0, data["image0"].shape)
+        # kpts1 = normalize_keypoints(kpts1, data["image1"].shape)
+
+        # Keypoint MLP encoder.
+        desc0 = desc0 + self.kenc(kpts0, data["scores0"])
+        desc1 = desc1 + self.kenc(kpts1, data["scores1"])
+
+        # Multi-layer Transformer network.
+        desc0, desc1 = self.gnn(desc0, desc1)
+
+        # Final MLP projection.
+        mdesc0, mdesc1 = self.final_proj(desc0), self.final_proj(desc1)
+        # Compute matching descriptor distance.
+        scores = torch.einsum("bdn,bdm->bnm", mdesc0, mdesc1)
+        scores = scores / self.config["descriptor_dim"] ** 0.5
+
+        # Run the optimal transport.
+        scores = log_optimal_transport(
+            scores, iters=self.config["sinkhorn_iterations"]
+        ) # (B, M, N)
+
+        if convert_to_probs:
+            scores = torch.softmax(scores, dim=-1)
+
+        return scores
+
     def forward_train(self, data):
         """Run SuperGlue on a pair of keypoints and descriptors"""
         batch_size = data["batch_size"]
