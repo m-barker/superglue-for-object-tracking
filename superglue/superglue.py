@@ -46,7 +46,6 @@ from copy import deepcopy
 from pathlib import Path
 import torch
 from torch import nn
-import torch_scatter as ts
 
 
 class LayerNorm(nn.Module):
@@ -177,26 +176,18 @@ def log_sinkhorn_iterations(Z, log_mu, log_nu, iters: int):
     return Z + u.unsqueeze(2) + v.unsqueeze(1)
 
 
-def log_optimal_transport(scores, alpha, iters: int):
+def log_optimal_transport(scores, iters: int):
     """Perform Differentiable Optimal Transport in Log-space for stability"""
     b, m, n = scores.shape
+    assert m == n
     one = scores.new_tensor(1)
     ms, ns = (m * one).to(scores), (n * one).to(scores)
 
-    bins0 = alpha.expand(b, m, 1)
-    bins1 = alpha.expand(b, 1, n)
-    alpha = alpha.expand(b, 1, 1)
+    norm = -(ms + ns).log() # log(1/(M+N))
+    log_mu = norm.expand(b, m) # (B, M) every row is weighted by 1/(M+N)
+    log_nu = norm.expand(b, n) # (B, N) every col is weighted by 1/(M+N)
 
-    couplings = torch.cat(
-        [torch.cat([scores, bins0], -1), torch.cat([bins1, alpha], -1)], 1
-    )
-
-    norm = -(ms + ns).log()
-    log_mu = torch.cat([norm.expand(m), ns.log()[None] + norm])
-    log_nu = torch.cat([norm.expand(n), ms.log()[None] + norm])
-    log_mu, log_nu = log_mu[None].expand(b, -1), log_nu[None].expand(b, -1)
-
-    Z = log_sinkhorn_iterations(couplings, log_mu, log_nu, iters)
+    Z = log_sinkhorn_iterations(scores, log_mu, log_nu, iters)
     Z = Z - norm  # multiply probabilities by M+N
     return Z
 
@@ -279,61 +270,6 @@ class SuperGlue(nn.Module):
                 )
             )
 
-    def forward(self, data, **kwargs):
-        """Run SuperGlue on a pair of keypoints and descriptors"""
-        if kwargs.get("mode", "test") == "train":
-            return self.forward_train(data)
-        desc0, desc1 = data["descriptors0"], data["descriptors1"]
-        kpts0, kpts1 = data["keypoints0"], data["keypoints1"]
-        if kpts0.shape[1] == 0 or kpts1.shape[1] == 0:  # no keypoints
-            shape0, shape1 = kpts0.shape[:-1], kpts1.shape[:-1]
-            return {
-                "matches0": kpts0.new_full(shape0, -1, dtype=torch.int),
-                "matches1": kpts1.new_full(shape1, -1, dtype=torch.int),
-                "matching_scores0": kpts0.new_zeros(shape0),
-                "matching_scores1": kpts1.new_zeros(shape1),
-            }
-        # Keypoint normalization.
-        kpts0 = normalize_keypoints(kpts0, data["image0"].shape)
-        kpts1 = normalize_keypoints(kpts1, data["image1"].shape)
-
-        # Keypoint MLP encoder.
-        desc0 = desc0 + self.kenc(kpts0, data["scores0"])
-        desc1 = desc1 + self.kenc(kpts1, data["scores1"])
-
-        # Multi-layer Transformer network.
-        desc0, desc1 = self.gnn(desc0, desc1)
-
-        # Final MLP projection.
-        mdesc0, mdesc1 = self.final_proj(desc0), self.final_proj(desc1)
-        # Compute matching descriptor distance.
-        scores = torch.einsum("bdn,bdm->bnm", mdesc0, mdesc1)
-        scores = scores / self.config["descriptor_dim"] ** 0.5
-
-        # Run the optimal transport.
-        scores = log_optimal_transport(
-            scores, self.bin_score, iters=self.config["sinkhorn_iterations"]
-        )
-        # Get the matches with score above "match_threshold".
-        max0, max1 = scores[:, :-1, :-1].max(2), scores[:, :-1, :-1].max(1)
-        indices0, indices1 = max0.indices, max1.indices
-        mutual0 = arange_like(indices0, 1)[None] == indices1.gather(1, indices0)
-        mutual1 = arange_like(indices1, 1)[None] == indices0.gather(1, indices1)
-        zero = scores.new_tensor(0)
-        mscores0 = torch.where(mutual0, max0.values.exp(), zero)
-        mscores1 = torch.where(mutual1, mscores0.gather(1, indices1), zero)
-        valid0 = mutual0 & (mscores0 > self.config["match_threshold"])
-        valid1 = mutual1 & valid0.gather(1, indices1)
-        indices0 = torch.where(valid0, indices0, indices0.new_tensor(-1))
-        indices1 = torch.where(valid1, indices1, indices1.new_tensor(-1))
-
-        return {
-            "matches0": indices0,  # use -1 for invalid match
-            "matches1": indices1,  # use -1 for invalid match
-            "matching_scores0": mscores0,
-            "matching_scores1": mscores1,
-        }
-
     def forward_train(self, data):
         """Run SuperGlue on a pair of keypoints and descriptors"""
         batch_size = data["batch_size"]
@@ -358,20 +294,38 @@ class SuperGlue(nn.Module):
 
         # Run the optimal transport.
         scores = log_optimal_transport(
-            scores, self.bin_score, iters=self.config["sinkhorn_iterations"]
-        )
-        # Get the matches with score above "match_threshold".
+            scores, iters=self.config["sinkhorn_iterations"]
+        ) # (B, M, N)
+
         gt_indexes = data["matches"]
-        neg_flag = (gt_indexes[:, 1] == -1) | (gt_indexes[:, 2] == -1)
         loss_pre_components = scores[
             gt_indexes[:, 0], gt_indexes[:, 1], gt_indexes[:, 2]
         ]
         loss_pre_components = torch.clamp(loss_pre_components, min=-100, max=0.0)
         loss_vector = -1 * loss_pre_components
-        neg_index, pos_index = gt_indexes[:, 0][neg_flag], gt_indexes[:, 0][~neg_flag]
-        # batched_loss = ts.scatter_mean(loss_vector, gt_indexes[:, 0])
-        batched_pos_loss, batched_neg_loss = (
-            ts.scatter_mean(loss_vector[~neg_flag], pos_index, dim_size=batch_size),
-            ts.scatter_mean(loss_vector[neg_flag], neg_index, dim_size=batch_size),
-        )
-        return loss
+        # TODO:
+        # Compute mean of loss vector over batch dimensions
+        # Can see if simple mean works for now
+        return loss_vector.mean()
+
+if __name__ == "__main__":
+    config = {}
+    model = SuperGlue(config)
+    data = {
+        "descriptors0": torch.rand(2, 256, 100),
+        "descriptors1": torch.rand(2, 256, 100),
+        "keypoints0": torch.rand(2, 100, 2),
+        "keypoints1": torch.rand(2, 100, 2),
+        "scores0": torch.rand(2, 100),
+        "scores1": torch.rand(2, 100),
+        "batch_size": 2,
+        "matches": # Identity: shouldbe of shape (200, 3) where each row is (batch_index, index_in_desc0, index_in_desc1)
+            torch.tensor([[0, i, i] for i in range(100)] + [[1, i, i] for i in range(100)]),
+    }
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    for i in range(1000):
+        opt.zero_grad()
+        loss = model.forward_train(data)
+        loss.backward()
+        opt.step()
+        print(f"Iteration {i}, loss: {loss.item()}")
