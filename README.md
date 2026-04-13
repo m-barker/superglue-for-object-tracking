@@ -1,2 +1,4 @@
 # superglue-for-object-tracking
 A modified implementation of superglue for objecting tracking -- given current and previous (noisy) object position/vel information, map objects from previous obs to current obs
+
+Modifies the original superglue code: https://github.com/magicleap/SuperGluePretrainedNetwork as well as a community implementation of superglue training: https://github.com/gouthamvgk/SuperGlue_training/tree/main
