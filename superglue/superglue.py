@@ -270,7 +270,9 @@ class SuperGlue(nn.Module):
                 )
             )
 
+    @torch.no_grad()
     def predict(self, data, convert_to_probs: bool = True) -> torch.Tensor:
+        self.eval()
         desc0, desc1 = data["descriptors0"], data["descriptors1"]
         kpts0, kpts1 = data["keypoints0"], data["keypoints1"]
 
@@ -297,6 +299,8 @@ class SuperGlue(nn.Module):
 
         if convert_to_probs:
             scores = torch.softmax(scores, dim=-1)
+            
+        self.train()
 
         return scores
 
