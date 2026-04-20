@@ -333,6 +333,12 @@ class SuperGlue(nn.Module):
         ]
         loss_pre_components = torch.clamp(loss_pre_components, min=-100, max=0.0)
         loss_vector = -1 * loss_pre_components
+
+        if "loss_mask" in data:
+            # Set loss to 0 for placeholder objects to prevent weight updates
+            loss_vector *= data["loss_mask"]
+            return loss_vector.sum() / data["loss_mask"].sum()
+
         # TODO:
         # Compute mean of loss vector over batch dimensions
         # Can see if simple mean works for now
