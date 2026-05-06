@@ -186,7 +186,7 @@ def log_optimal_transport(scores, iters: int):
     norm = -(ms + ns).log() # log(1/(M+N))
     log_mu = norm.expand(b, m) # (B, M) every row is weighted by 1/(M+N)
     log_nu = norm.expand(b, n) # (B, N) every col is weighted by 1/(M+N)
-
+                                                                                                                                                                                    
     Z = log_sinkhorn_iterations(scores, log_mu, log_nu, iters)
     Z = Z - norm  # multiply probabilities by M+N
     return Z
@@ -216,10 +216,10 @@ class SuperGlue(nn.Module):
     """
 
     default_config = {
-        "descriptor_dim": 256,
+        "descriptor_dim": 128,
         "weights_path": None,
-        "keypoint_encoder": [32, 64, 128, 256],
-        "GNN_layers": ["self", "cross"] * 9,
+        "keypoint_encoder": [32, 64, 128, 128],
+        "GNN_layers": ["self", "cross"] * 2,
         "sinkhorn_iterations": 100,
         "match_threshold": 0.2,
         "use_layernorm": False,
@@ -270,14 +270,11 @@ class SuperGlue(nn.Module):
                 )
             )
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def predict(self, data, convert_to_probs: bool = True) -> torch.Tensor:
         self.eval()
         desc0, desc1 = data["descriptors0"], data["descriptors1"]
         kpts0, kpts1 = data["keypoints0"], data["keypoints1"]
-
-        # kpts0 = normalize_keypoints(kpts0, data["image0"].shape)
-        # kpts1 = normalize_keypoints(kpts1, data["image1"].shape)
 
         # Keypoint MLP encoder.
         desc0 = desc0 + self.kenc(kpts0, data["scores0"])
@@ -298,13 +295,13 @@ class SuperGlue(nn.Module):
         ) # (B, M, N)
 
         if convert_to_probs:
-            scores = torch.softmax(scores, dim=-1)
-            
-        self.train()
+            scores = scores.exp()
 
+        self.train()
         return scores
 
     def forward_train(self, data):
+
         """Run SuperGlue on a pair of keypoints and descriptors"""
         batch_size = data["batch_size"]
         desc0, desc1 = data["descriptors0"], data["descriptors1"]
@@ -354,7 +351,7 @@ if __name__ == "__main__":
     data = {
         "descriptors0": torch.rand(2, 256, 100),
         "descriptors1": torch.rand(2, 256, 100),
-        "keypoints0": torch.rand(2, 100, 2),
+        "keypoints0": torch.rand(2, 100, 2),                                                                                
         "keypoints1": torch.rand(2, 100, 2),
         "scores0": torch.rand(2, 100),
         "scores1": torch.rand(2, 100),
@@ -362,10 +359,12 @@ if __name__ == "__main__":
         "matches": # Identity: shouldbe of shape (200, 3) where each row is (batch_index, index_in_desc0, index_in_desc1)
             torch.tensor([[0, i, i] for i in range(100)] + [[1, i, i] for i in range(100)]),
     }
-    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)                                                                         
     for i in range(1000):
         opt.zero_grad()
         loss = model.forward_train(data)
         loss.backward()
         opt.step()
         print(f"Iteration {i}, loss: {loss.item()}")
+
+        
